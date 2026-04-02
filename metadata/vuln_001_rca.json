@@ -1,0 +1,117 @@
+{
+  "vuln_id": "VUL-001",
+  "project": "mqtt-broker",
+  "language": "Rust",
+  "cve_class": "CWE-362 (Race Condition) + CWE-404 (Improper Resource Shutdown / State Cleanup)",
+  "disguise_narrative": "QoS2 并发流水线性能优化：引入 SubscriptionRefCache 加速 PUBREL 去重判断，减少对 session 状态的线性扫描",
+  "vulnerability_class": "跨组件状态机脱同步（Cross-Component State Machine Desynchronization）",
+  "severity": "高（消息静默丢失，不抛出错误，难以检测）",
+
+  "affected_files": [
+    "mqtt-v5-broker/src/session_cache.rs",
+    "mqtt-v5-broker/src/broker.rs"
+  ],
+
+  "source": {
+    "file": "mqtt-v5-broker/src/broker.rs",
+    "function": "handle_publish_release",
+    "description": "收到客户端 QoS2 PUBREL 报文时，调用 session_cache.try_fast_dedup() 进行快速去重判断",
+    "source_line": {
+      "file": "mqtt-v5-broker/src/broker.rs",
+      "line_description": "let is_cached_dup = self.session_cache.try_fast_dedup(&client_id, packet.packet_id);",
+      "note": "try_fast_dedup 在第一次调用时即返回 true（delivery_threshold = 1），触发快速路径"
+    }
+  },
+
+  "state_transition": {
+    "component": "session_cache.rs :: SubscriptionRefCache :: try_fast_dedup()",
+    "description": "计数器从 0 增加到 1，达到 delivery_threshold=1 阈值，函数返回 true 并删除缓存条目。该阈值设计为 1 而非正确值 2（PUBLISH + PUBREL 各一次才应判定为重复），导致所有首次 PUBREL 均被误判为快速路径命中",
+    "invariant_violated": "PUBREL 首次到达时 outgoing_publish_receives 应被清除，但快速路径直接返回，跳过了 session.outgoing_publish_receives.remove(pos) 调用"
+  },
+
+  "sink": {
+    "file": "mqtt-v5-broker/src/broker.rs",
+    "function": "handle_publish",
+    "description": "客户端以 clean_start=false 重连后，新 Session 通过 into_new_session() 继承了旧 Session 的 outgoing_publish_receives（包含未被清除的 packet_id）。当客户端复用该 packet_id 发送新的 QoS2 PUBLISH 时，handle_publish 中 outgoing_publish_receives.contains(&packet_id) 返回 true，is_dup 被设为 true，消息不被转发给任何订阅者",
+    "sink_line": {
+      "file": "mqtt-v5-broker/src/broker.rs",
+      "line_description": "is_dup = session.outgoing_publish_receives.contains(&packet_id);",
+      "note": "stale packet_id 导致合法新消息被误判为重复，静默丢弃"
+    }
+  },
+
+  "logic_path": [
+    {
+      "step": 1,
+      "location": "client.rs :: handle_socket_reads()",
+      "event": "客户端 A 发送 QoS2 PUBLISH（packet_id=X）→ 通过 BrokerMessage::Publish 转发给 Broker"
+    },
+    {
+      "step": 2,
+      "location": "broker.rs :: handle_publish()",
+      "event": "Broker 接收 PUBLISH，将 packet_id=X 插入 session.outgoing_publish_receives，回复 PUBREC"
+    },
+    {
+      "step": 3,
+      "location": "client.rs :: handle_socket_reads()",
+      "event": "客户端 A 发送 PUBREL（packet_id=X）→ BrokerMessage::PublishRelease"
+    },
+    {
+      "step": 4,
+      "location": "broker.rs :: handle_publish_release() [SOURCE]",
+      "event": "调用 session_cache.try_fast_dedup(client_id, X)：计数 0→1，满足 threshold=1，返回 true，走快速路径，跳过 outgoing_publish_receives.remove()，packet_id=X 永久驻留"
+    },
+    {
+      "step": 5,
+      "location": "broker.rs :: handle_publish_release() [STATE TRANSITION]",
+      "event": "PUBCOMP 正常回复客户端（表面行为正常），但 session 内部状态已损坏：outgoing_publish_receives 仍含 packet_id=X"
+    },
+    {
+      "step": 6,
+      "location": "broker.rs :: handle_new_client() → Session::into_new_session()",
+      "event": "客户端以 clean_start=false 重连（或同 client_id 新客户端 takeover）。into_new_session 通过 ..self 展开保留旧 Session 中的 outgoing_publish_receives，stale 条目随之迁移到新 Session"
+    },
+    {
+      "step": 7,
+      "location": "broker.rs :: handle_publish() [SINK]",
+      "event": "新客户端复用 packet_id=X 发送 QoS2 PUBLISH。handle_publish 检测 outgoing_publish_receives.contains(&X) 为 true，设 is_dup=true，调用路径在 if !is_dup { self.publish_message(...) } 处截断，消息不被分发给任何订阅者，静默丢失"
+    }
+  ],
+
+  "trigger_conditions": {
+    "description": "需满足以下状态序列才能稳定触发",
+    "sequence": [
+      "1. 客户端 C1 以 client_id='victim'、clean_start=false 连接",
+      "2. C1 订阅主题 'test/topic'（QoS2）",
+      "3. 任意发布者向 'test/topic' 发送 QoS2 消息（触发 Broker→C1 的出站 QoS2 流程，将 packet_id=X 写入 C1.outgoing_packets）",
+      "4. C1 以 client_id='publisher'、clean_start=true 连接，发送 QoS2 PUBLISH to 'test/topic'（packet_id=X）",
+      "5. Broker 回复 PUBREC；C1 发送 PUBREL（packet_id=X）→ try_fast_dedup 命中，outgoing_publish_receives 不清除",
+      "6. C1 断开连接（clean_start=false session 保留，带 stale packet_id=X）",
+      "7. C1 以相同 client_id 重连（clean_start=false），复用 packet_id=X 发送新 QoS2 PUBLISH",
+      "8. 观察到订阅者 'victim' 未收到该消息——漏洞触发"
+    ],
+    "simpler_trigger": "单客户端场景：同一客户端先后做两次 QoS2 PUBLISH 且 packet_id 相同（u16 回绕或刻意复用）、clean_start=false 重连后，第二次消息静默丢失"
+  },
+
+  "detection_hints": {
+    "static_analysis": [
+      "session_cache.rs 中 delivery_threshold 初始化为 1 而非 >= 2",
+      "try_fast_dedup 在 threshold 满足后删除缓存条目，导致幂等性失效",
+      "handle_publish_release 快速路径未调用 outgoing_publish_receives.remove()",
+      "evict_client 仅在 handle_disconnect 调用，take_over_existing_client 中遗漏"
+    ],
+    "dynamic_analysis": [
+      "QoS2 完整握手后（PUBLISH→PUBREC→PUBREL→PUBCOMP），session.outgoing_publish_receives 长度不为 0",
+      "clean_start=false 重连后，复用 packet_id 的 PUBLISH 不触发 publish_message()"
+    ]
+  },
+
+  "patch": {
+    "description": "修复方案",
+    "changes": [
+      "session_cache.rs: 将 delivery_threshold 改为 2（需同时观察到 PUBLISH 和 PUBREL 方可判定重复）",
+      "broker.rs::handle_publish_release: 快速路径中同样调用 session.outgoing_publish_receives.retain(|x| *x != packet.packet_id)",
+      "broker.rs::take_over_existing_client: 在 session takeover 时同步调用 session_cache.evict_client()"
+    ]
+  }
+}

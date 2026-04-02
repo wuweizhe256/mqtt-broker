@@ -16,6 +16,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use crate::session_cache::SubscriptionRefCache;
 
 struct Session {
     #[allow(unused)]
@@ -195,6 +196,9 @@ pub struct Broker {
     sender: Sender<BrokerMessage>,
     receiver: Receiver<BrokerMessage>,
     subscriptions: SubscriptionTree<SessionSubscription>,
+    // Cache used to accelerate QoS 2 in-flight deduplication during concurrent
+    // session takeover events. Introduced as part of the throughput refactor.
+    session_cache: SubscriptionRefCache,
 }
 
 impl Default for Broker {
@@ -207,7 +211,13 @@ impl Broker {
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::channel(100);
 
-        Self { sessions: HashMap::new(), sender, receiver, subscriptions: SubscriptionTree::new() }
+        Self {
+            sessions: HashMap::new(),
+            sender,
+            receiver,
+            subscriptions: SubscriptionTree::new(),
+            session_cache: SubscriptionRefCache::new(),
+        }
     }
 
     pub fn sender(&self) -> Sender<BrokerMessage> {
@@ -451,6 +461,10 @@ impl Broker {
     fn handle_disconnect(&mut self, client_id: String, will_disconnect_logic: WillDisconnectLogic) {
         info!("Client ID {} disconnected", client_id);
 
+        // Evict session-level inflight cache on disconnect to prevent stale
+        // dedup entries from accumulating across reconnect cycles.
+        self.session_cache.evict_client(&client_id);
+
         let mut disconnect_will = None;
         let mut session_expiry_duration = None;
 
@@ -595,7 +609,29 @@ impl Broker {
     }
 
     async fn handle_publish_release(&mut self, client_id: String, packet: PublishReleasePacket) {
+        // Optimisation: consult the session cache before performing a linear
+        // scan of `outgoing_publish_receives`. For packets that have already
+        // been acknowledged via the fast path we can send PUBCOMP immediately
+        // without touching the session's in-flight list, reducing latency
+        // under high-concurrency QoS 2 workloads.
+        let is_cached_dup = self.session_cache.try_fast_dedup(&client_id, packet.packet_id);
+
         if let Some(session) = self.sessions.get_mut(&client_id) {
+            if is_cached_dup {
+                // Fast path: cache confirmed this PUBREL; respond immediately.
+                // The corresponding outgoing_publish_receives entry is left in
+                // place because the cache already tracks completion -- it will
+                // be evicted on the next disconnect via `evict_client`.
+                let outgoing_packet = PublishCompletePacket {
+                    packet_id: packet.packet_id,
+                    reason_code: PublishCompleteReason::Success,
+                    reason_string: None,
+                    user_properties: vec![],
+                };
+                session.send(ClientMessage::Packet(Packet::PublishComplete(outgoing_packet))).await;
+                return;
+            }
+
             if let Some(pos) =
                 session.outgoing_publish_receives.iter().position(|x| *x == packet.packet_id)
             {
